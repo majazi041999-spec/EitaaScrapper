@@ -1,13 +1,25 @@
 # EitaaScrapper
 
-Multi-thread scraper for Eitaa channels that:
-- Reads channels from a text file (`@channel` per line)
-- Scrapes posts in a Gregorian date range (`YYYY-MM-DD`)
-- Sums view counts and counts posts per channel
-- Generates a clean UTF-8 Persian report
-- Writes separate logs for verbose, warning, and error
+اسکرپر چندترد ایتا با ورودی **Excel** و خروجی فارسی UTF-8.
 
-## Install
+## قابلیت‌ها
+
+- ورودی از فایل اکسل (`.xlsx`) با 3 ستون در هر ردیف:
+  1. کانال (مثال: `@mychannel`)
+  2. لینک پست شروع بازه (مثال: `https://eitaa.com/mychannel/1200`)
+  3. لینک پست پایان بازه (مثال: `https://eitaa.com/mychannel/1350`)
+- اسکرول آهسته برای لود دقیق ویوها
+- محاسبه‌ی دقیق:
+  - کل پست‌ها و کل ویوها
+  - آمار پست‌های فوروارد و غیرفوروارد (هم پست و هم ویو)
+  - تعداد پست‌های عکس‌دار، ویدیویی و استیکری
+- لاگ‌گذاری تفکیک‌شده:
+  - `verbose.log`
+  - `warning.log`
+  - `error.log`
+- اجرای کامندی تعاملی (مسیر فایل را می‌توانید با drag & drop داخل ترمینال وارد کنید)
+
+## نصب
 
 ```bash
 python -m venv .venv
@@ -16,50 +28,33 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-## Channel list file example
-
-Create a txt file such as `channels.txt`:
-
-```txt
-@channel1
-@channel2
-@channel3
-```
-
-## Run
+## اجرای برنامه
 
 ```bash
-python eitaa_scraper.py \
-  --channels-file channels.txt \
-  --start-date 2025-01-01 \
-  --end-date 2025-01-31 \
-  --threads 20 \
-  --output result_fa.txt \
-  --log-dir logs
+python eitaa_scraper.py
 ```
 
-### Arguments
+بعد از اجرا، برنامه از شما این موارد را می‌پرسد:
 
-- `--channels-file`: path to channel list txt file
-- `--start-date`: start date in `YYYY-MM-DD` (example: `2025-01-01`)
-- `--end-date`: end date in `YYYY-MM-DD` (example: `2025-01-31`)
-- `--threads`: worker threads (for large lists, 30-40 is possible on strong hardware)
-- `--output`: Persian output report path
-- `--log-dir`: log folder path (`verbose.log`, `warning.log`, `error.log`)
-- `--headful`: run browser visible mode (for debugging)
+- مسیر فایل اکسل
+- تعداد ترد
+- مسیر فایل خروجی گزارش
+- مسیر پوشه لاگ
+- حالت headful (نمایش مرورگر)
 
-## Output
+## فرمت اکسل
 
-- Final report (UTF-8 Persian): `result_fa.txt`
-- Logs:
-  - `logs/verbose.log`
-  - `logs/warning.log`
-  - `logs/error.log`
+ستون‌ها باید به ترتیب زیر باشند:
 
-## Notes for accuracy
+| channel | start_link | end_link |
+|---|---|---|
+| @mychannel | https://eitaa.com/mychannel/1200 | https://eitaa.com/mychannel/1350 |
+| @another | https://eitaa.com/another/501 | https://eitaa.com/another/620 |
 
-- The scraper uses browser rendering (Playwright + Chromium) so JS-loaded posts can be read.
-- It scrolls repeatedly to load older messages and stops when no new data is observed for several rounds.
-- The scraper only counts real post cards and reads `time[datetime]` + dedicated views element to avoid false counting.
-- Date parsing is strict (ISO datetime or YYYY-MM-DD/YYYY/MM/DD), so noisy message text cannot corrupt totals.
-- If a post date or view cannot be parsed confidently, it is skipped and logged.
+> نکته: اگر لینک شروع/پایان برعکس باشد، برنامه خودش اصلاح می‌کند.
+
+## خروجی
+
+- گزارش نهایی فارسی UTF-8 (پیش‌فرض: `result_fa.txt`)
+- فایل‌های لاگ در پوشه‌ی `logs`
+
