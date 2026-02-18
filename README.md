@@ -60,5 +60,6 @@ python eitaa_scraper.py \
 
 - The scraper uses browser rendering (Playwright + Chromium) so JS-loaded posts can be read.
 - It scrolls repeatedly to load older messages and stops when no new data is observed for several rounds.
-- The script tries multiple patterns for extracting post date/view text to reduce failures on markup changes.
+- The scraper only counts real post cards and reads `time[datetime]` + dedicated views element to avoid false counting.
+- Date parsing is strict (ISO datetime or YYYY-MM-DD/YYYY/MM/DD), so noisy message text cannot corrupt totals.
 - If a post date or view cannot be parsed confidently, it is skipped and logged.

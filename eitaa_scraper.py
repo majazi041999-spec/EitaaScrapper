@@ -23,16 +23,17 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Iterable, Optional
 
-from dateutil import parser as date_parser
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 BASE_URL = "https://eitaa.com"
 DEFAULT_TIMEOUT_MS = 25000
-SCROLL_WAIT_SECONDS = 1.1
-MAX_IDLE_SCROLLS = 8
+SCROLL_WAIT_SECONDS = 1.0
+MAX_IDLE_SCROLLS = 10
 
 LOGGER_NAME = "eitaa_scraper"
+
+_DIGIT_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
 
 @dataclasses.dataclass
@@ -114,12 +115,22 @@ def parse_channel_file(channel_file: Path) -> list[str]:
     return sorted(set(channels))
 
 
+def _normalize_number_text(text: str) -> str:
+    return (
+        text.translate(_DIGIT_MAP)
+        .replace(",", "")
+        .replace(" ", "")
+        .replace("٬", "")
+        .replace("٫", ".")
+        .lower()
+    )
+
+
 def _parse_views(text: str) -> Optional[int]:
     if not text:
         return None
 
-    cleaned = text.replace(",", "").replace(" ", "").replace("٬", "").replace("٫", ".").lower()
-
+    cleaned = _normalize_number_text(text)
     match = re.search(r"(\d+(?:\.\d+)?)([km]?)", cleaned)
     if not match:
         return None
@@ -134,55 +145,76 @@ def _parse_views(text: str) -> Optional[int]:
     return int(number)
 
 
-def _parse_post_date(text: str) -> Optional[date]:
-    if not text:
-        return None
-
-    text = text.strip()
-
-    numeric = re.search(r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})", text)
-    if numeric:
-        fmt = "%Y-%m-%d" if "-" in numeric.group(1) else "%Y/%m/%d"
+def _parse_post_date(date_iso: str, date_text: str) -> Optional[date]:
+    if date_iso:
+        normalized = date_iso.strip().replace("Z", "+00:00")
         try:
-            return datetime.strptime(numeric.group(1), fmt).date()
+            return datetime.fromisoformat(normalized).date()
         except ValueError:
             pass
 
+    text = (date_text or "").strip()
+    if not text:
+        return None
+
+    text = text.translate(_DIGIT_MAP)
+    numeric = re.search(r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})", text)
+    if not numeric:
+        return None
+
+    raw = numeric.group(1)
+    fmt = "%Y-%m-%d" if "-" in raw else "%Y/%m/%d"
     try:
-        parsed = date_parser.parse(text, fuzzy=True, dayfirst=False)
-        return parsed.date()
-    except Exception:
+        return datetime.strptime(raw, fmt).date()
+    except ValueError:
         return None
 
 
 def _extract_posts_payload(page) -> list[dict]:
     script = """
     () => {
-      const candidates = Array.from(document.querySelectorAll('[class*=\"message\"], [class*=\"post\"], article, .tgme_widget_message_wrap'));
-      const unique = [];
+      const wrapSelectors = [
+        '.tgme_widget_message_wrap',
+        '.etme_widget_message_wrap',
+        '.widget_message_wrap'
+      ];
+
+      const wraps = [];
+      for (const selector of wrapSelectors) {
+        for (const node of document.querySelectorAll(selector)) {
+          wraps.push(node);
+        }
+      }
+
+      const rows = [];
       const seen = new Set();
-      for (const node of candidates) {
-        if (!node || seen.has(node)) continue;
-        seen.add(node);
 
-        const dateNode = node.querySelector('time, [class*=\"date\"], [class*=\"meta\"]');
-        const viewsNode = node.querySelector('[class*=\"view\"], [class*=\"counter\"], [class*=\"meta\"]');
+      for (const wrap of wraps) {
+        const messageNode = wrap.querySelector('[data-post], .tgme_widget_message, .etme_widget_message') || wrap;
 
-        const dateText = dateNode ? (dateNode.getAttribute('datetime') || dateNode.textContent || '') : '';
-        const viewText = viewsNode ? (viewsNode.textContent || '') : '';
+        const postId = messageNode.getAttribute('data-post')
+          || wrap.getAttribute('data-post')
+          || messageNode.id
+          || wrap.id
+          || '';
 
-        const combinedText = (node.textContent || '').slice(-400);
+        if (!postId || seen.has(postId)) {
+          continue;
+        }
+        seen.add(postId);
 
-        const rawId = node.getAttribute('data-post') || node.id || '';
+        const timeNode = wrap.querySelector('time[datetime], .tgme_widget_message_date time, .etme_widget_message_date time');
+        const viewsNode = wrap.querySelector('.tgme_widget_message_views, .etme_widget_message_views, [class*="message_views"]');
 
-        unique.push({
-          id: rawId,
-          date_text: dateText,
-          views_text: viewText,
-          fallback_text: combinedText
+        rows.push({
+          id: postId,
+          date_iso: timeNode ? (timeNode.getAttribute('datetime') || '') : '',
+          date_text: timeNode ? (timeNode.textContent || '') : '',
+          views_text: viewsNode ? (viewsNode.textContent || '') : ''
         });
       }
-      return unique;
+
+      return rows;
     }
     """
     return page.evaluate(script)
@@ -193,7 +225,7 @@ def _navigate_to_channel(page, channel: str, logger: logging.Logger) -> None:
     url = f"{BASE_URL}/{channel_name}"
     logger.info("Opening channel %s at %s", channel, url)
     page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(1600)
 
 
 def _scan_channel_posts(
@@ -204,62 +236,73 @@ def _scan_channel_posts(
     logger: logging.Logger,
 ) -> ChannelResult:
     result = ChannelResult(channel=channel)
-    collected_ids: set[str] = set()
+    counted_ids: set[str] = set()
+    seen_ids: set[str] = set()
     idle_scrolls = 0
-    reached_older_than_start = False
+    older_rounds = 0
 
-    while idle_scrolls < MAX_IDLE_SCROLLS and not reached_older_than_start:
+    while idle_scrolls < MAX_IDLE_SCROLLS and older_rounds < 3:
         payload = _extract_posts_payload(page)
-        before_count = len(collected_ids)
+        new_seen = 0
+        min_date_this_round: Optional[date] = None
 
         for item in payload:
-            post_id = item.get("id") or f"{item.get('date_text','')}-{item.get('views_text','')}-{hash(item.get('fallback_text', ''))}"
-            if post_id in collected_ids:
+            post_id = (item.get("id") or "").strip()
+            if not post_id:
                 continue
 
-            combined_date_text = f"{item.get('date_text', '')} {item.get('fallback_text', '')}"
-            parsed_date = _parse_post_date(combined_date_text)
+            if post_id not in seen_ids:
+                seen_ids.add(post_id)
+                new_seen += 1
+
+            parsed_date = _parse_post_date(item.get("date_iso", ""), item.get("date_text", ""))
             if parsed_date is None:
-                logger.debug("[%s] Skipping post with unknown date format", channel)
+                logger.debug("[%s] post=%s skipped: unrecognized date", channel, post_id)
                 continue
 
-            if parsed_date < start_date:
-                reached_older_than_start = True
+            if min_date_this_round is None or parsed_date < min_date_this_round:
+                min_date_this_round = parsed_date
+
+            if parsed_date < start_date or parsed_date > end_date:
                 continue
 
-            if parsed_date > end_date:
+            if post_id in counted_ids:
                 continue
 
-            combined_view_text = f"{item.get('views_text', '')} {item.get('fallback_text', '')}"
-            views = _parse_views(combined_view_text)
+            views = _parse_views(item.get("views_text", ""))
             if views is None:
-                logger.warning("[%s] Could not parse view count for one post (date=%s)", channel, parsed_date)
+                logger.warning("[%s] post=%s skipped: unrecognized views='%s'", channel, post_id, item.get("views_text", ""))
                 continue
 
-            collected_ids.add(post_id)
+            counted_ids.add(post_id)
             result.post_count += 1
             result.total_views += views
-            result.first_post_date = (
-                parsed_date if result.first_post_date is None else min(result.first_post_date, parsed_date)
-            )
-            result.last_post_date = (
-                parsed_date if result.last_post_date is None else max(result.last_post_date, parsed_date)
-            )
+            result.first_post_date = parsed_date if result.first_post_date is None else min(result.first_post_date, parsed_date)
+            result.last_post_date = parsed_date if result.last_post_date is None else max(result.last_post_date, parsed_date)
 
-        if len(collected_ids) == before_count:
+        if min_date_this_round and min_date_this_round < start_date:
+            older_rounds += 1
+        else:
+            older_rounds = 0
+
+        if new_seen == 0:
             idle_scrolls += 1
         else:
             idle_scrolls = 0
 
-        page.mouse.wheel(0, 2500)
+        logger.debug(
+            "[%s] round stats: discovered=%d counted=%d idle=%d older_rounds=%d",
+            channel,
+            len(seen_ids),
+            len(counted_ids),
+            idle_scrolls,
+            older_rounds,
+        )
+
+        page.mouse.wheel(0, 2800)
         page.wait_for_timeout(int(SCROLL_WAIT_SECONDS * 1000))
 
-    logger.info(
-        "[%s] Finished scan: posts=%d total_views=%d",
-        channel,
-        result.post_count,
-        result.total_views,
-    )
+    logger.info("[%s] Finished scan: posts=%d total_views=%d", channel, result.post_count, result.total_views)
     return result
 
 
